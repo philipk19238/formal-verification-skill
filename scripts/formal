@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -eu
+here=${0:A:h}
+if [[ -z "${MODAL_TOKEN_ID:-}" && -n "${FORMAL_DEV_ENV:-}" ]]; then
+  export $(grep -E '^MODAL_TOKEN_(ID|SECRET)=' "$FORMAL_DEV_ENV" | sed 's/"//g' | xargs)
+fi
+exec uv run --quiet --no-project --with 'modal>=1.6' python -I "$here/formal.py" "$@"
