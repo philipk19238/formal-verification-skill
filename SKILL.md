@@ -8,7 +8,7 @@ description: Verify concurrency protocols with TLA+ (TLC) and pure logic with Le
 Every TLC and Lean run goes through `scripts/formal`, which runs on Modal (8 CPU, 16 GB per check, up to 100 in parallel). Never start `java` or `lean`/`lake` locally. Local TLC once ran 12 JVMs at the same time and made the laptop unusable.
 
 ```bash
-F=~/.claude/skills/formal-verification/scripts/formal
+F=~/.claude/skills/formal-verification/scripts/formal   # or ~/.agents/skills/... for Codex
 $F check Spec.tla                 # every cfg/*.cfg and ./*.cfg in parallel, checked against its expectation (fast tier)
 $F check Spec.tla --tier full     # only the expensive cfgs; --tier all runs everything
 $F check Spec.tla cfg/A.cfg -- -deadlock          # chosen cfgs, extra TLC args after --
@@ -22,9 +22,9 @@ $F trace traces/Bug-X.txt         # a TLC log reduced to what each step changed 
 $F deploy                         # after editing formal.py
 ```
 
-Put this line in every agent brief that touches TLA+ or Lean:
+Put this line in every agent brief that touches TLA+ or Lean, with `<skill dir>` replaced by the installed path:
 
-> Run TLC and Lean only through `~/.claude/skills/formal-verification/scripts/formal` (`check`, `tlc`, `lean`, `mutate`). Never start java, lean or lake locally.
+> Run TLC and Lean only through `<skill dir>/scripts/formal` (`check`, `tlc`, `lean`, `mutate`). Never start java, lean or lake locally.
 
 ## 1. Pick problems that are cheap to verify
 
