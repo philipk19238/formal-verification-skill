@@ -8,7 +8,7 @@ description: Verify concurrency protocols with TLA+ (TLC) and pure logic with Le
 Every TLC and Lean run goes through `scripts/formal`, which runs on Modal (8 CPU, 16 GB per check, up to 100 in parallel). Never start `java` or `lean`/`lake` locally. Local TLC once ran 12 JVMs at the same time and made the laptop unusable.
 
 ```bash
-F=~/.claude/skills/formal-verification/scripts/formal   # or ~/.agents/skills/... for Codex
+F=<skill dir>/scripts/formal       # wherever this skill is installed
 $F check Spec.tla                 # every cfg/*.cfg and ./*.cfg in parallel, checked against its expectation (fast tier)
 $F check Spec.tla --tier full     # only the expensive cfgs; --tier all runs everything
 $F check Spec.tla cfg/A.cfg -- -deadlock          # chosen cfgs, extra TLC args after --
@@ -57,7 +57,7 @@ Triage, done quickly:
 
 The machines are independent. Model and check them concurrently, never one after another.
 
-Use the Workflow tool when it is available. Invoking this skill counts as opt-in. Otherwise spawn parallel Agent subagents. All agents run on Opus. The shape:
+Use your agent's workflow or parallel-subagent tool; invoking this skill counts as opt-in. Run every subagent on your strongest model. The shape:
 
 ```
 Discover  (1 agent, or do it inline)  -> list of machines with code pointers + one-line properties
@@ -67,7 +67,7 @@ Fix       (main loop)                 -> code fix + the spec's fixed variant mus
 Full tier (once, at the end)          -> `formal check --tier full` on every spec
 ```
 
-- Use `pipeline()` so that a machine that finishes modelling goes straight to verification.
+- Pipeline the stages, so a machine that finishes modelling goes straight to verification instead of waiting for the others.
 - Each agent works in its own folder (`<root>/NN-<machine>/`) and writes nowhere else.
 - Modal handles the parallel load. Agents don't need to coordinate their TLC runs.
 - Agents return structured results: machine, property, verdict, state count, counterexample summary, code pointer, and real-or-artifact.

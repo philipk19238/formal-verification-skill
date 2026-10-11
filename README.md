@@ -18,16 +18,10 @@ npx skills add philipk19238/formal-verification-skill
 
 ### Via cloning the repo
 
-Claude Code:
+Clone it into your agent's skills directory, for example:
 
 ```bash
-mkdir -p ~/.claude/skills && git clone https://github.com/philipk19238/formal-verification-skill ~/.claude/skills/formal-verification
-```
-
-Codex:
-
-```bash
-mkdir -p ~/.agents/skills && git clone https://github.com/philipk19238/formal-verification-skill ~/.agents/skills/formal-verification
+git clone https://github.com/philipk19238/formal-verification-skill ~/.agents/skills/formal-verification
 ```
 
 ### One-time runner setup
