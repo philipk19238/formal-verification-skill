@@ -15,6 +15,7 @@ Usage (from the spec or project directory):
         the property it names now fails. All mutants run in parallel.
     formal trace LOG...            reduce a TLC log to what each step changed
     formal deploy                  (re)deploy the Modal app
+    FORMAL_TIMING=1 formal ...     also print each phase's seconds (container start, build, audit) on stderr
 
 cfg header lines (TLA comments, anywhere in the cfg):
     \\* expect: holds | violated [NAME] | deadlock     default: holds
@@ -32,6 +33,7 @@ mutations file (beside NAME.tla or NAME.lean):
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -43,30 +45,30 @@ from pathlib import Path
 
 import modal
 
-APP_NAME = "formal"
+APP_NAME = os.environ.get("FORMAL_APP", "formal")
 MODAL_ENV = os.environ.get("FORMAL_MODAL_ENV", "dev")
 JAR = Path(os.environ.get("FORMAL_TLA_JAR", "~/.local/share/formal/tla2tools.jar")).expanduser()
 CPU = float(os.environ.get("FORMAL_CPU", "8"))
 MEMORY_MB = int(os.environ.get("FORMAL_MEMORY_MB", "16384"))
 WARM_S = int(os.environ.get("FORMAL_WARM_S", "180"))
+LEAN_WARM_S = int(os.environ.get("FORMAL_LEAN_WARM_S", "600"))
+# TLC runs twice as many workers as reserved CPUs: the container may burst onto idle host cores, and
+# 16 workers finished a 4M-state cfg 25% sooner than 8 (never slower).
+WORKERS = int(os.environ.get("FORMAL_TLC_WORKERS", str(int(CPU) * 2)))
 SKIP_DIRS = {"states", "traces", ".git", "__pycache__", ".lake", "build"}
 TLA_FILES = {".tla", ".cfg"}
 LEAN_FILES = {".lean"}
 LEAN_NAMES = {"lakefile.lean", "lakefile.toml", "lean-toolchain", "lake-manifest.json"}
 AUDIT_TIMEOUT_S = int(os.environ.get("FORMAL_AUDIT_TIMEOUT_S", "600"))
+MUTANT_JOBS = int(os.environ.get("FORMAL_MUTANT_JOBS", "4"))
 STD_AXIOMS = {"propext", "Quot.sound", "Classical.choice"}
 
 app = modal.App(APP_NAME)
-cache = modal.Volume.from_name("formal-cache", create_if_missing=True)
+cache = modal.Volume.from_name(os.environ.get("FORMAL_VOLUME", "formal-cache"), create_if_missing=True)
 tla_image = (
     modal.Image.from_registry("eclipse-temurin:21-jre", add_python="3.12")
     .add_local_file(JAR, "/opt/tla2tools.jar", copy=True)
-    .env({"TLC_HEAP_MB": str(int(MEMORY_MB * 0.75)), "TLC_WORKERS": str(int(CPU))})
-)
-lean_image = (
-    modal.Image.from_registry("debian:bookworm-slim", add_python="3.12")
-    .apt_install("curl", "git", "ca-certificates")
-    .env({"ELAN_HOME": "/cache/elan", "PATH": "/cache/elan/bin:/usr/local/bin:/usr/bin:/bin"})
+    .env({"TLC_HEAP_MB": str(int(MEMORY_MB * 0.75)), "TLC_WORKERS": str(WORKERS)})
 )
 
 
@@ -96,13 +98,13 @@ def _lean_bundle(root: Path) -> bytes:
 
 
 def _remote_args(args: list[str]) -> list[str]:
-    """Drop -metadir, and -workers unless it asks for 1..CPU workers (1 makes BFS traces shortest)."""
+    """Drop -metadir, and -workers unless it asks for 1..WORKERS workers (1 makes BFS traces shortest)."""
     out: list[str] = []
     it = iter(args)
     for arg in it:
         if arg in ("-metadir", "-workers"):
             value = next(it, "")
-            if arg == "-workers" and value.isdigit() and 1 <= int(value) <= int(CPU):
+            if arg == "-workers" and value.isdigit() and 1 <= int(value) <= WORKERS:
                 out += [arg, value]
             continue
         out.append(arg)
@@ -114,6 +116,8 @@ def tlc(bundle: bytes, args: list[str]):
     import subprocess
     import tempfile
 
+    yield ("started", time.time())
+    t0 = time.time()
     work = Path(tempfile.mkdtemp(prefix="tlc-"))
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
         tar.extractall(work, filter="data")
@@ -127,6 +131,7 @@ def tlc(bundle: bytes, args: list[str]):
     for line in proc.stdout:
         yield ("out", line)
     rc = proc.wait()
+    yield ("timing", ("tlc", time.time() - t0))
     files = {}
     for p in work.rglob("*"):
         rel = p.relative_to(work)
@@ -174,23 +179,107 @@ open Lean Elab Command in
   IO.println s!"AUDITED {audited} declarations"
 """
 
+# The same audit as a compiled program. It imports only the audited modules, so it skips loading
+# all of Lean (about 5 s): the audit fell from 5 s to 1.8 s with identical hashes.
+AUDIT_MAIN = r"""
+import Lean
+open Lean
 
-@app.function(image=lean_image, cpu=CPU, memory=MEMORY_MB, timeout=3600, volumes={"/cache": cache}, scaledown_window=WARM_S)
+def main (args : List String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let targets : Array Name := args.toArray.map String.toName
+  unsafe enableInitializersExecution
+  let env ← importModules (targets.map ({ module := · })) {} (loadExts := true)
+  let standard : Array Name := #[``propext, ``Classical.choice, ``Quot.sound]
+  let audit : CoreM Unit := do
+    let mut audited := 0
+    for (module, data) in env.header.moduleNames.zip env.header.moduleData do
+     unless targets.contains module do continue
+     for name in data.constNames do
+      let user := (privateToUserName? name).getD name
+      if user.isInternal then continue
+      let some info := env.find? name | continue
+      if info matches .axiomInfo _ then
+        IO.println s!"AXIOMS {user} declares an axiom"
+        continue
+      audited := audited + 1
+      let extra := (← collectAxioms name).filter (!standard.contains ·)
+      unless extra.isEmpty do IO.println s!"AXIOMS {user} depends on {extra.toList}"
+      if (← findDeclarationRanges? name).isNone then continue
+      let (kind, value) := match info with
+        | .thmInfo _ => ("theorem", none)
+        | .defnInfo v => ("definition", if Meta.isInstanceCore env name then none else some v.value)
+        | .opaqueInfo _ => ("opaque", none)
+        | .inductInfo _ => ("inductive", none)
+        | .ctorInfo _ => ("constructor", none)
+        | .recInfo _ => ("recursor", none)
+        | _ => ("other", none)
+      let pp ← Meta.MetaM.run' <| Meta.ppExpr info.type
+      let record := Json.mkObj [
+        ("module", toJson module.toString), ("name", toJson user.toString), ("kind", toJson kind),
+        ("typeHash", toJson s!"{mixHash (hash info.levelParams) info.type.hash}"),
+        ("valueHash", match value with | some v => toJson s!"{v.hash}" | none => Json.null),
+        ("type", toJson pp.pretty)]
+      IO.println s!"STATEMENT {record.compress}"
+    IO.println s!"AUDITED {audited} declarations"
+  let opens := [`Lean, `Lean.Elab, `Lean.Elab.Command].map (OpenDecl.simple · [])
+  discard <| audit.toIO { fileName := "<audit>", fileMap := default, openDecls := opens } { env }
+  return 0
+"""
+AUDIT_LAKEFILE = 'name = "audit"\ndefaultTargets = ["audit"]\n\n[[lean_exe]]\nname = "audit"\nroot = "Main"\nsupportInterpreter = true\n'
+
+
+def _audit_build_cmd(toolchain_dir: str, out_dir: str) -> str:
+    """Shell that builds the audit program for one installed toolchain, or leaves no program behind."""
+    files = {"Main.lean": AUDIT_MAIN, "lakefile.toml": AUDIT_LAKEFILE}
+    write = " && ".join(f"echo {base64.b64encode(t.encode()).decode()} | base64 -d > {n}" for n, t in files.items())
+    pin = f"$(basename {toolchain_dir} | sed 's/---/:/; s|--|/|')"
+    return f"rm -rf {out_dir} && mkdir -p {out_dir} && cd {out_dir} && echo {pin} > lean-toolchain && {write} && (lake build >build.log 2>&1 || rm -rf .lake/build/bin)"
+
+
+LEAN_PINS = os.environ.get("FORMAL_LEAN_PINS", "leanprover/lean4:v4.34.1 leanprover/lean4:stable").split()
+ELAN_INIT = "curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --no-modify-path --default-toolchain none"
+# Toolchains never live on the volume: on a fresh container `import Lean` read from it took 62-996 s,
+# against 4 s from the image. These pins are in the image; any other installs onto the container's
+# own disk on first use (18 s), and stays there while the container is warm.
+lean_image = (
+    modal.Image.from_registry("debian:bookworm-slim", add_python="3.12")
+    .apt_install("curl", "git", "ca-certificates")
+    .env({"ELAN_HOME": "/opt/elan", "PATH": "/opt/elan/bin:/usr/local/bin:/usr/bin:/bin"})
+    .run_commands(
+        ELAN_INIT,
+        *(f"elan toolchain install {pin}" for pin in LEAN_PINS),
+        r"elan run leanprover/lean4:stable lean --version | sed -E 's|^Lean \(version ([^,]+),.*|leanprover/lean4:v\1|' > /opt/elan/stable",
+        "for t in /opt/elan/toolchains/*; do (" + _audit_build_cmd("$t", "/opt/audit/$(basename $t)") + "); done",
+    )
+)
+
+
+@app.function(image=lean_image, cpu=CPU, memory=MEMORY_MB, timeout=3600, volumes={"/cache": cache}, scaledown_window=LEAN_WARM_S)
 def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, mutants: list | None = None):
     import subprocess
     import tempfile
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     def run(cmd: list[str] | str, cwd: Path) -> int:
-        proc = subprocess.Popen(cmd, cwd=cwd, shell=isinstance(cmd, str), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(cmd, cwd=cwd, shell=isinstance(cmd, str), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         assert proc.stdout is not None
         for line in proc.stdout:
             out.append(line)
         return proc.wait()
 
+    def lap(phase: str):
+        now = time.time()
+        secs, clock[0] = now - clock[0], now
+        return ("timing", (phase, secs))
+
     out: list[str] = []
+    env = dict(os.environ)
+    clock = [time.time()]
+    yield ("started", clock[0])
     cache.reload()
-    if not Path("/cache/elan/bin/elan").exists():
-        run("curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --no-modify-path --default-toolchain none", Path("/"))
+    yield lap("reload")
     work = Path("/cache/projects") / project
     work.mkdir(parents=True, exist_ok=True)
     previous: dict[str, tuple[bytes, float]] = {}
@@ -209,8 +298,18 @@ def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, m
         old = previous.get(rel)
         stamp = old[1] if old and old[0] == (work / rel).read_bytes() else now
         os.utime(work / rel, (stamp, stamp))
-    if not (work / "lean-toolchain").exists():
-        (work / "lean-toolchain").write_text("leanprover/lean4:stable\n")
+    pin = (work / "lean-toolchain").read_text().strip() if (work / "lean-toolchain").exists() else "leanprover/lean4:stable"
+    if pin == "leanprover/lean4:stable":
+        pin = Path("/opt/elan/stable").read_text().strip()
+    (work / "lean-toolchain").write_text(pin + "\n")
+    tdir = pin.replace("/", "--").replace(":", "---")
+    baked = (Path("/opt/elan/toolchains") / tdir).exists()
+    audit_dir = Path("/opt/audit" if baked else "/root/audit") / tdir
+    if not baked:
+        env.update(ELAN_HOME="/root/elan", PATH="/root/elan/bin:" + env["PATH"])
+        if not Path("/root/elan/bin/elan").exists():
+            run(ELAN_INIT, Path("/"))
+    yield lap("unpack")
     yield ("out", "".join(out))
     out.clear()
 
@@ -226,7 +325,12 @@ def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, m
         for f in files:
             out.append(f"--- {f}\n")
             rc = max(rc, run(["lean", f], work))
-    cache.commit()
+    if lakefile and rc == 0 and audit and not baked and not (audit_dir / "build.log").exists():
+        run(_audit_build_cmd(f"/root/elan/toolchains/{tdir}", str(audit_dir)), Path("/"))
+    yield lap("build")
+    # The audit and mutants only read the volume, so the commit runs beside them.
+    committer = threading.Thread(target=cache.commit)
+    committer.start()
     yield ("out", "".join(out))
     out.clear()
 
@@ -247,12 +351,17 @@ def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, m
             out.append(f"MODULE {src} {module}\n")
         if modules:
             mods = sorted(set(modules.values()))
-            program = "import Lean\n" + "".join(f"import {m}\n" for m in mods)
-            program += AUDIT_LEAN.replace("MODULES", ", ".join(f"`{m}" for m in mods))
-            tmp = Path(tempfile.mkdtemp(prefix="audit-")) / "Audit.lean"
-            tmp.write_text(program)
-            arc = run(["timeout", str(AUDIT_TIMEOUT_S), "lake", "env", "lean", str(tmp)], work)
+            exe = audit_dir / ".lake/build/bin/audit"
+            if exe.exists():
+                arc = run(["timeout", str(AUDIT_TIMEOUT_S), "lake", "env", str(exe), *mods], work)
+            else:
+                program = "import Lean\n" + "".join(f"import {m}\n" for m in mods)
+                program += AUDIT_LEAN.replace("MODULES", ", ".join(f"`{m}" for m in mods))
+                tmp = Path(tempfile.mkdtemp(prefix="audit-")) / "Audit.lean"
+                tmp.write_text(program)
+                arc = run(["timeout", str(AUDIT_TIMEOUT_S), "lake", "env", "lean", str(tmp)], work)
             out.append(f"AUDIT_RC {arc}\n")
+        yield lap("audit")
         yield ("audit", "".join(out))
         out.clear()
 
@@ -260,20 +369,37 @@ def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, m
         if rc != 0:
             yield ("out", "base build failed; mutants not checked\n")
         else:
-            for i, (label, rel, content) in enumerate(mutants):
+            def elaborate(job):
+                i, (label, rel, content) = job
                 tmp = Path(tempfile.mkdtemp(prefix=f"mut{i}-")) / Path(rel).name
                 tmp.write_text(content)
-                mrc = run(["lake", "env", "lean", str(tmp)] if lakefile else ["lean", str(tmp)], work)
-                yield ("mutant", (label, mrc, str(tmp), "".join(out)))
-                out.clear()
+                cmd = ["lake", "env", "lean", str(tmp)] if lakefile else ["lean", str(tmp)]
+                proc = subprocess.run(cmd, cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                return label, proc.returncode, str(tmp), proc.stdout
+
+            # A few at a time: each `lean` holds its imports in memory, and a Mathlib import is large.
+            with ThreadPoolExecutor(MUTANT_JOBS) as pool:
+                for result in pool.map(elaborate, enumerate(mutants)):
+                    yield ("mutant", result)
+            yield lap("mutants")
+    committer.join()
+    yield lap("commit wait")
     yield ("rc", rc)
+
+
+TIMINGS: list[tuple[str, float]] = []  # (phase, seconds), printed to stderr when FORMAL_TIMING is set
 
 
 def _collect(gen, sink, extras: dict | None = None, keep_files: bool = True) -> int:
     rc = 1
+    called = time.time()
     try:
         for kind, value in gen:
-            if kind == "out":
+            if kind == "started":
+                TIMINGS.append(("container start", value - called))
+            elif kind == "timing":
+                TIMINGS.append(value)
+            elif kind == "out":
                 sink.write(value)
                 sink.flush()
             elif kind in ("audit", "mutant") and extras is not None:
@@ -744,4 +870,10 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    start = time.time()
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    finally:
+        if os.environ.get("FORMAL_TIMING"):
+            for phase, secs in [*TIMINGS, ("total", time.time() - start)]:
+                sys.stderr.write(f"TIMING {phase} {secs:.2f}\n")

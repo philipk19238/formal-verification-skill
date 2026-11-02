@@ -83,7 +83,14 @@ formal deploy                       # redeploy the Modal app after editing forma
 | `FORMAL_MODAL_ENV` | `dev` | Modal environment the app is deployed to |
 | `FORMAL_TLA_JAR` | `~/.local/share/formal/tla2tools.jar` | TLA+ tools jar baked into the TLC image |
 | `FORMAL_CPU` / `FORMAL_MEMORY_MB` | `8` / `16384` | Size of each container |
-| `FORMAL_WARM_S` | `180` | Seconds a container stays warm after a call |
+| `FORMAL_WARM_S` | `180` | Seconds a TLC container stays warm after a call |
+| `FORMAL_LEAN_WARM_S` | `600` | Seconds a Lean container stays warm after a call |
+| `FORMAL_TLC_WORKERS` | twice `FORMAL_CPU` | TLC workers when a run doesn't ask for `-workers` |
+| `FORMAL_LEAN_PINS` | `leanprover/lean4:v4.34.1 leanprover/lean4:stable` | Lean toolchains baked into the image, each with a compiled axiom audit |
+| `FORMAL_AUDIT_TIMEOUT_S` | `600` | Ceiling on one Lean axiom audit |
+| `FORMAL_MUTANT_JOBS` | `4` | Lean mutants elaborated at a time |
+| `FORMAL_APP` / `FORMAL_VOLUME` | `formal` / `formal-cache` | Modal app and cache volume; new names give a trial copy that leaves the shared one alone |
+| `FORMAL_TIMING` | unset | Set to print each phase's seconds (start, reload, build, audit) on stderr |
 | `FORMAL_OUT` | `traces` | Where per-cfg logs and reduced traces are written |
 | `FORMAL_DEV_ENV` | unset | Dotenv file holding `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` |
 
