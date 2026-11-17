@@ -5,7 +5,7 @@ description: Verify concurrency protocols with TLA+ (TLC) and pure logic with Le
 
 # Formal verification (TLA+ and Lean)
 
-Every TLC and Lean run goes through `scripts/formal`, which runs on Modal (8 CPU, 16 GB per check, up to 100 in parallel). Never start `java` or `lean`/`lake` locally. Local TLC once ran 12 JVMs at the same time and made the laptop unusable.
+Every TLC and Lean run goes through `scripts/formal`, which runs on Modal (up to 8 CPU and 16 GB per check, billed for what it uses, up to 100 in parallel). Never start `java` or `lean`/`lake` locally. Local TLC once ran 12 JVMs at the same time and made the laptop unusable.
 
 ```bash
 F=<skill dir>/scripts/formal       # wherever this skill is installed

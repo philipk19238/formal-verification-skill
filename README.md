@@ -1,6 +1,6 @@
 # Formal Verification Skill
 
-A skill for coding agents that verifies concurrency protocols with [TLA+](https://lamport.azurewebsites.net/tla/tla.html) (TLC) and pure logic with [Lean 4](https://lean-lang.org/). Every check runs on [Modal](https://modal.com) containers (8 CPU and 16 GB each, up to 100 in parallel), never on your laptop.
+A skill for coding agents that verifies concurrency protocols with [TLA+](https://lamport.azurewebsites.net/tla/tla.html) (TLC) and pure logic with [Lean 4](https://lean-lang.org/). Every check runs on [Modal](https://modal.com) containers (up to 8 CPU and 16 GB each, fast-tier checks billed for what they use, up to 100 in parallel), never on your laptop.
 
 ## Overview
 
@@ -82,7 +82,8 @@ formal deploy                       # redeploy the Modal app after editing forma
 |---|---|---|
 | `FORMAL_MODAL_ENV` | `dev` | Modal environment the app is deployed to |
 | `FORMAL_TLA_JAR` | `~/.local/share/formal/tla2tools.jar` | TLA+ tools jar baked into the TLC image |
-| `FORMAL_CPU` / `FORMAL_MEMORY_MB` | `8` / `16384` | Size of each container |
+| `FORMAL_CPU` / `FORMAL_MEMORY_MB` | `8` / `16384` | Most a container may use; full-tier cfgs and `formal tlc` reserve all of it |
+| `FORMAL_CPU_REQUEST` / `FORMAL_MEMORY_REQUEST_MB` | `1` / `2048` | What a container reserves; Modal bills the larger of this and what it uses |
 | `FORMAL_WARM_S` | `180` | Seconds a TLC container stays warm after a call |
 | `FORMAL_LEAN_WARM_S` | `600` | Seconds a Lean container stays warm after a call |
 | `FORMAL_TLC_WORKERS` | twice `FORMAL_CPU` | TLC workers when a run doesn't ask for `-workers` |

@@ -50,6 +50,10 @@ MODAL_ENV = os.environ.get("FORMAL_MODAL_ENV", "dev")
 JAR = Path(os.environ.get("FORMAL_TLA_JAR", "~/.local/share/formal/tla2tools.jar")).expanduser()
 CPU = float(os.environ.get("FORMAL_CPU", "8"))
 MEMORY_MB = int(os.environ.get("FORMAL_MEMORY_MB", "16384"))
+# Modal bills the larger of the request and the use, and lets a container burst to its limit, so a small request with
+# CPU and MEMORY_MB as limits costs what a check uses: a tiny cfg or a warm, idle container no longer pays for 8 cores.
+CPU_REQUEST = float(os.environ.get("FORMAL_CPU_REQUEST", "1"))
+MEMORY_REQUEST_MB = int(os.environ.get("FORMAL_MEMORY_REQUEST_MB", "2048"))
 WARM_S = int(os.environ.get("FORMAL_WARM_S", "180"))
 LEAN_WARM_S = int(os.environ.get("FORMAL_LEAN_WARM_S", "600"))
 # TLC runs twice as many workers as reserved CPUs: the container may burst onto idle host cores, and
@@ -61,6 +65,10 @@ LEAN_FILES = {".lean"}
 LEAN_NAMES = {"lakefile.lean", "lakefile.toml", "lean-toolchain", "lake-manifest.json"}
 AUDIT_TIMEOUT_S = int(os.environ.get("FORMAL_AUDIT_TIMEOUT_S", "600"))
 MUTANT_JOBS = int(os.environ.get("FORMAL_MUTANT_JOBS", "4"))
+# One `lean` on a large model needs far more than MEMORY_MB: internal-urls/15-routing-reverse peaks at 52 GB per
+# elaboration (its build, and each mutant). The Lean function's hard limit is this, and only use is billed.
+LEAN_MEMORY_LIMIT_MB = int(os.environ.get("FORMAL_LEAN_MEMORY_LIMIT_MB", "262144"))
+MUTANT_TIMEOUT_S = int(os.environ.get("FORMAL_MUTANT_TIMEOUT_S", str(3 * 3600)))
 STD_AXIOMS = {"propext", "Quot.sound", "Classical.choice"}
 
 app = modal.App(APP_NAME)
@@ -111,7 +119,7 @@ def _remote_args(args: list[str]) -> list[str]:
     return out
 
 
-@app.function(image=tla_image, cpu=CPU, memory=MEMORY_MB, timeout=3 * 3600, max_containers=100, scaledown_window=WARM_S)
+@app.function(image=tla_image, cpu=(CPU_REQUEST, CPU), memory=(MEMORY_REQUEST_MB, MEMORY_MB), timeout=3 * 3600, max_containers=100, scaledown_window=WARM_S)
 def tlc(bundle: bytes, args: list[str]):
     import subprocess
     import tempfile
@@ -255,7 +263,7 @@ lean_image = (
 )
 
 
-@app.function(image=lean_image, cpu=CPU, memory=MEMORY_MB, timeout=3600, volumes={"/cache": cache}, scaledown_window=LEAN_WARM_S)
+@app.function(image=lean_image, cpu=(CPU_REQUEST, CPU), memory=(MEMORY_REQUEST_MB, LEAN_MEMORY_LIMIT_MB), timeout=3600, volumes={"/cache": cache}, scaledown_window=LEAN_WARM_S)
 def lean(bundle: bytes, project: str, targets: list[str], audit: bool = False, mutants: list | None = None):
     import subprocess
     import tempfile
@@ -421,6 +429,12 @@ def _fn(name: str):
     return modal.Function.from_name(APP_NAME, name, environment_name=MODAL_ENV)
 
 
+def _tlc(tier: str):
+    """A full-tier model reserves the whole container: on a 1-core request a 41M-state model ran 30% slower."""
+    fn = _fn("tlc")
+    return fn.with_options(cpu=CPU, memory=MEMORY_MB) if tier == "full" else fn
+
+
 TLC_VIOLATION = re.compile(
     r"Invariant (\S+) is violated"
     r"|Temporal properties were violated"
@@ -542,7 +556,7 @@ def _split_tier(argv: list[str]) -> tuple[list[str], list[str], str]:
 
 
 def run_tlc(args: list[str]) -> int:
-    return _collect(_fn("tlc").remote_gen(_tla_bundle(Path.cwd()), _remote_args(args)), sys.stdout)
+    return _collect(_tlc("full").remote_gen(_tla_bundle(Path.cwd()), _remote_args(args)), sys.stdout)
 
 
 def run_check(argv: list[str]) -> int:
@@ -557,16 +571,16 @@ def run_check(argv: list[str]) -> int:
     if skipped:
         print(f"skipping {len(skipped)} cfg(s) outside tier {tier}: {' '.join(c.stem for c in skipped)}", flush=True)
     bundle = _tla_bundle(Path.cwd())
-    fn = _fn("tlc")
+    fns = {t: _tlc(t) for t in ("fast", "full")}
     out_dir = Path(os.environ.get("FORMAL_OUT", "traces"))
     out_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
 
     def one(job):
-        cfg, want, name, _ = job
+        cfg, want, name, cfg_tier = job
         t0 = time.monotonic()
         buf = io.StringIO()
-        rc = _collect(fn.remote_gen(bundle, _remote_args([*extra, "-config", str(cfg), spec])), buf)
+        rc = _collect(fns[cfg_tier].remote_gen(bundle, _remote_args([*extra, "-config", str(cfg), spec])), buf)
         text = buf.getvalue()
         (out_dir / f"{cfg.stem}.txt").write_text(text)
         trace = reduce_trace(text)
@@ -717,7 +731,7 @@ def _mutate_tla(spec: Path, mutations: list[dict], tier: str, extra: list[str]) 
     in_tier = {s: v for s, v in info.items() if tier == "all" or v[3] == tier}
     out_dir = Path(os.environ.get("FORMAL_OUT", "traces")) / "mutants"
     out_dir.mkdir(parents=True, exist_ok=True)
-    fn = _fn("tlc")
+    fns = {t: _tlc(t) for t in ("fast", "full")}
     spec_text = spec.read_text()
 
     jobs = []  # (mutation index, cfg stem, cfg path in bundle, kind, args)
@@ -744,7 +758,7 @@ def _mutate_tla(spec: Path, mutations: list[dict], tier: str, extra: list[str]) 
     def one(job):
         i, stem, cfg_rel, kind, args = job
         buf = io.StringIO()
-        rc = _collect(fn.remote_gen(bundles[i], _remote_args([*args, "-config", cfg_rel, spec_rel])), buf, keep_files=False)
+        rc = _collect(fns[info[stem][3]].remote_gen(bundles[i], _remote_args([*args, "-config", cfg_rel, spec_rel])), buf, keep_files=False)
         text = buf.getvalue()
         slug = re.sub(r"[^A-Za-z0-9]+", "-", mutations[i]["label"]).strip("-")[:60]
         (out_dir / f"{i:02d}-{slug}--{stem}.txt").write_text(text)
@@ -797,7 +811,12 @@ def _mutate_lean(model: Path, mutations: list[dict]) -> int:
     extras: dict[str, list] = {}
     buf = io.StringIO()
     start = time.monotonic()
-    rc = _collect(_fn("lean").remote_gen(_lean_bundle(root), root.name, [], mutants=payload), buf, extras)
+    # Mutants elaborate MUTANT_JOBS at a time, each as large as the model's own build (four RoutingReverse mutants
+    # held 211 GB). Past the memory limit the container is OOM-killed or thrashes until Modal drops it ("internal
+    # failure"); an int memory in with_options moves only the request, so the limit is passed as a pair. Four at a
+    # time on CPU cores, 28 such mutants take about an hour: past the function's own timeout.
+    reserved = _fn("lean").with_options(cpu=CPU, memory=(MEMORY_MB, LEAN_MEMORY_LIMIT_MB), timeout=MUTANT_TIMEOUT_S)
+    rc = _collect(reserved.remote_gen(_lean_bundle(root), root.name, [], mutants=payload), buf, extras)
     if rc != 0:
         sys.stdout.write(buf.getvalue())
         print("base build failed; fix the unmutated model first")
